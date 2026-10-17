@@ -55,29 +55,40 @@ def parse_salary(value: Any) -> Salary:
         return Salary()
     raw = value.strip()
     compact = raw.lower()
-    if "bonus" in compact or "commission" in compact:
-        return Salary(raw="Base not specified", bonus=raw)
-    if "php" not in compact and "₱" not in raw:
+    if "commission" in compact:
         return Salary(raw=raw)
+    bonus = None
+    if "bonus" in compact:
+        # Only the explicit "plus bonus" form separates a base from a bonus.
+        split = re.split(r"\bplus\s+bonus\b", raw, maxsplit=1, flags=re.IGNORECASE)
+        if len(split) != 2:
+            return Salary(raw=raw)
+        raw_base = split[0].strip()
+        bonus = "Bonus disclosed (amount not specified)"
+    else:
+        raw_base = raw
+    if re.search(r"\d\s*(?:k|m|thousand|million)\b", raw_base, re.IGNORECASE):
+        return Salary(raw=raw)
+    currency = "PHP" if "php" in compact or "₱" in raw else ""
     period = None
-    if re.search(r"\b(?:per\s+month|monthly|a\s+month|month|mo)\b", compact):
+    if re.search(r"\b(?:per\s+month|monthly|a\s+month|month|mo)\b", raw_base.lower()):
         period = SalaryPeriod.MONTHLY
-    elif re.search(r"\b(?:per\s+year|annually|annual|yearly|year|yr)\b", compact):
+    elif re.search(r"\b(?:per\s+year|annually|annual|yearly|year|yr)\b", raw_base.lower()):
         period = SalaryPeriod.ANNUAL
-    elif re.search(r"\b(?:per\s+day|daily|day)\b", compact):
+    elif re.search(r"\b(?:per\s+day|daily|day)\b", raw_base.lower()):
         period = SalaryPeriod.DAILY
-    elif re.search(r"\b(?:per\s+hour|hourly|hour|hr)\b", compact):
+    elif re.search(r"\b(?:per\s+hour|hourly|hour|hr)\b", raw_base.lower()):
         period = SalaryPeriod.HOURLY
-    if period is None:
-        return Salary(raw=raw)
     try:
-        amounts = [Decimal(match.group().replace(",", "")) for match in _MONEY.finditer(raw)]
+        amounts = [Decimal(match.group().replace(",", "")) for match in _MONEY.finditer(raw_base)]
     except InvalidOperation:
         return Salary(raw=raw)
-    if not amounts or amounts[0] <= 0 or (len(amounts) > 1 and amounts[1] < amounts[0]):
+    if (not amounts or len(amounts) > 2 or amounts[0] <= 0
+            or (len(amounts) > 1 and amounts[1] < amounts[0])):
         return Salary(raw=raw)
-    return Salary(lower=amounts[0], upper=amounts[1] if len(amounts) > 1 else None,
-                  period=period, raw=raw)
+    return Salary(currency=currency, lower=amounts[0],
+                  upper=amounts[1] if len(amounts) > 1 else None,
+                  period=period, raw=raw_base, bonus=bonus)
 
 
 def map_job(row: Any) -> JobListing | None:
@@ -94,7 +105,7 @@ def map_job(row: Any) -> JobListing | None:
     return JobListing(
         source="Jooble PH", source_id=str(identifier), title=title.strip(), employer=employer.strip(),
         location=location.strip(), ncr_workplace_or_base=identified_ncr_location(location),
-        salary=parse_salary(row.get("salary")), work_arrangement="Not specified",
+        salary=parse_salary(row.get("salary")), work_arrangement="",
         employment_type=str(row.get("type") or "Not specified"),
         application_url=link.strip(),
         # Jooble's documented result does not include expiry or closure state.

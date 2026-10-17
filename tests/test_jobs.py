@@ -7,7 +7,7 @@ from job_alert_bot.jobs import JobListing, Salary, SalaryPeriod, eligible, month
 def job(identifier="one", salary=None, **changes):
     values = dict(source="test", source_id=identifier, title="Role", employer="Employer",
                   location="Makati City, NCR", ncr_workplace_or_base=True,
-                  salary=salary or Salary(), work_arrangement="Hybrid", employment_type="Full-time",
+                  salary=salary if salary is not None else Salary(lower=Decimal("50000"), period=SalaryPeriod.MONTHLY), work_arrangement="Hybrid", employment_type="Full-time",
                   application_url=f"https://example.com/apply/{identifier}")
     values.update(changes)
     return JobListing(**values)
@@ -38,7 +38,7 @@ def test_salary_normalization_requires_explicit_work_time():
 
 
 def test_ranking_uses_lower_base_and_puts_unknown_last():
-    jobs = [job("unknown"), job("monthly", Salary(lower=Decimal("80000"), upper=Decimal("90000"),
+    jobs = [job("unknown", Salary(lower=Decimal("70000"), period=None)), job("monthly", Salary(lower=Decimal("80000"), upper=Decimal("90000"),
                                                  period=SalaryPeriod.MONTHLY)),
             job("annual", Salary(lower=Decimal("1080000"), period=SalaryPeriod.ANNUAL)),
             job("excluded", Salary(lower=Decimal("200000"), period=SalaryPeriod.MONTHLY),

@@ -28,7 +28,7 @@ def test_jooble_mapping_filters_ncr_and_keeps_uncomparable_pay_last():
         row(6, "Pasig City", "Negotiable"),
         row(7, "Manila", "PHP 90,000 per month", "javascript:bad"),
     ]]
-    assert [item.source_id for item in ranked_jobs(jobs)] == ["3", "1", "5", "6"]
+    assert [item.source_id for item in ranked_jobs(jobs)] == ["3", "1", "5"]
     assert monthly_salary_lower(jobs[2]) == Decimal("100000")
     assert monthly_salary_lower(jobs[4]) is None
     assert jobs[0].application_url == "https://ph.jooble.org/jdp/1"
@@ -79,9 +79,12 @@ def test_approval_gate_and_live_request_shape(monkeypatch):
 def test_unknown_salary_and_bonus_are_not_ranked_as_base():
     no_period = jooble.parse_salary("PHP 80,000 - 100,000")
     bonus = jooble.parse_salary("PHP 80,000 per month plus bonus")
-    assert no_period.lower is None and no_period.raw == "PHP 80,000 - 100,000"
-    assert bonus.lower is None and bonus.bonus is not None
+    assert no_period.lower == 80000 and no_period.period is None
+    assert bonus.lower == 80000 and bonus.bonus is not None
     assert jooble.parse_salary("PHP 800 per day").period == SalaryPeriod.DAILY
+    assert jooble.parse_salary("PHP 80k monthly").lower is None
+    assert jooble.parse_salary("Commission only").lower is None
+    assert jooble.map_job(row(9, "Makati", "PHP 80,000 monthly")).work_arrangement == ""
 
 
 @pytest.mark.parametrize("status,body,headers,error", [

@@ -1,8 +1,8 @@
 """PostgreSQL storage for per-server settings and successful deliveries."""
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint, create_engine, text
+from sqlalchemy import BigInteger, Date, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint, create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 
@@ -38,6 +38,29 @@ class SourceRequestUsage(Base):
 
     source_key_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
     requests_reserved: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class CollectionCycle(Base):
+    """A daily reservation prevents a second provider fetch after a restart."""
+
+    __tablename__ = "collection_cycles"
+
+    manila_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),
+                                                 default=lambda: datetime.now(timezone.utc))
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False, default="started")
+
+
+class DailyBatch(Base):
+    """One real batch per server per Philippine date."""
+
+    __tablename__ = "daily_batches"
+
+    guild_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("server_configs.guild_id"), primary_key=True)
+    manila_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    posted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),
+                                                default=lambda: datetime.now(timezone.utc))
 
 
 def make_session_factory(database_url: str):

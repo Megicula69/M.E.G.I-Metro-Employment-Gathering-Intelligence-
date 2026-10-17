@@ -58,6 +58,33 @@ class CollectionService:
         self._last_report: CollectionResult | None = None
         self._generation = 0
 
+    def cached_report(self) -> CollectionResult:
+        """Return only results still inside each provider's permitted retention."""
+        jobs: list[JobListing] = []
+        statuses = {name: SourceStatus("disabled", reason) for name, reason in self.disabled.items()}
+        now = time.monotonic()
+        for source in self.enabled:
+            state = self._states[source.name]
+            if state.cached_jobs is not None and now < state.cache_until:
+                jobs.extend(state.cached_jobs)
+                statuses[source.name] = SourceStatus(
+                    "success" if state.cached_jobs else "no_results", "Permitted cache", cached=True)
+            elif state.last_error is not None:
+                statuses[source.name] = state.last_error
+            else:
+                statuses[source.name] = SourceStatus("unavailable", "No retained results; next collection is 6 PM Philippine time")
+        unique = []
+        seen_ids, seen_urls = set(), set()
+        for job in ranked_jobs(jobs):
+            url_hash = canonical_url_hash(job.application_url)
+            if job.key in seen_ids or (url_hash and url_hash in seen_urls):
+                continue
+            unique.append(job)
+            seen_ids.add(job.key)
+            if url_hash:
+                seen_urls.add(url_hash)
+        return CollectionResult(unique, statuses)
+
     async def collect(self) -> CollectionResult:
         observed_generation = self._generation
         async with self._lock:

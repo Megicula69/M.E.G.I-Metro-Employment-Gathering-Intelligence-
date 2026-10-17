@@ -98,7 +98,10 @@ def test_cached_results_expire_at_permitted_retention(monkeypatch):
     collector = CollectionService([EnabledSource("One", source, permitted_cache_seconds=10)])
     asyncio.run(collector.collect())
     clock.now = 105.0
+    assert len(collector.cached_report().jobs) == 1
     assert asyncio.run(collector.collect()).statuses["One"].cached
     clock.now = 110.0
+    assert collector.cached_report().all_unavailable
+    assert collector.cached_report().jobs == []
     assert not asyncio.run(collector.collect()).statuses["One"].cached
     assert source.calls == 2

@@ -1,6 +1,9 @@
-"""Discord slash commands for a manual local demonstration."""
+"""Discord slash commands and daily Philippine-time collection."""
 
+import asyncio
+import logging
 import os
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
@@ -10,6 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from .collection import CollectionService, EnabledSource
 from .database import ServerConfig, make_session_factory
+from .daily import MANILA, due_cycle_date, next_daily_run, run_daily_cycle
 from .delivery import DeliveryService
 from .jooble import JooblePhilippinesSource
 from .sources import SampleDataSource
@@ -23,6 +27,7 @@ class JobBot(commands.Bot):
         self.delivery = DeliveryService(sessions)
         self.test_guild_id = test_guild_id
         self.collection = collection or CollectionService([], {"All sources": "No provider is configured"})
+        self._daily_task: asyncio.Task | None = None
 
     async def setup_hook(self) -> None:
         await self.add_cog(Jobs(self))
@@ -32,6 +37,33 @@ class JobBot(commands.Bot):
             await self.tree.sync(guild=guild)
         else:
             await self.tree.sync()
+        self._daily_task = asyncio.create_task(self._daily_loop())
+
+    async def close(self) -> None:
+        if self._daily_task:
+            self._daily_task.cancel()
+        await super().close()
+
+    def _configured_channel(self, config: ServerConfig):
+        channel = self.get_channel(config.alert_channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return None
+        if Jobs._missing_permissions(channel):
+            return None
+        return channel
+
+    async def _daily_loop(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            now = datetime.now(timezone.utc)
+            if due_cycle_date(now) is not None:
+                try:
+                    await run_daily_cycle(now, self.sessions, self.collection, self.delivery,
+                                          self._configured_channel)
+                except Exception:
+                    logging.exception("Daily collection failed")
+            seconds = max(1, (next_daily_run(datetime.now(timezone.utc)) - datetime.now(timezone.utc)).total_seconds())
+            await asyncio.sleep(seconds)
 
 
 class Jobs(commands.GroupCog, group_name="jobs", group_description="NCR job alert controls"):
@@ -106,14 +138,14 @@ class Jobs(commands.GroupCog, group_name="jobs", group_description="NCR job aler
             result = await self.bot.delivery.post_new(interaction.guild_id, channel, SampleDataSource())
         except Exception as exc:
             await interaction.followup.send(
-                f"Preview stopped after an error ({type(exc).__name__}). Already posted jobs were saved; run preview again to resume.",
+                f"Preview failed ({type(exc).__name__}). No jobs in the failed batch were recorded.",
                 ephemeral=True)
             return
         await interaction.followup.send(
             f"Posted {result.sent} sample job(s) in {channel.mention}; skipped {result.skipped_already_sent} already delivered job(s).",
             ephemeral=True)
 
-    @app_commands.command(name="fetch", description="Fetch and post real eligible NCR jobs from Jooble PH")
+    @app_commands.command(name="fetch", description="Post real NCR jobs from permitted daily cached results")
     @app_commands.default_permissions(administrator=True)
     @app_commands.guild_only()
     async def fetch(self, interaction: discord.Interaction) -> None:
@@ -135,26 +167,31 @@ class Jobs(commands.GroupCog, group_name="jobs", group_description="NCR job aler
             return
         await interaction.response.defer(ephemeral=True)
         try:
-            collection = await self.bot.collection.collect()
+            collection = self.bot.collection.cached_report()
             status_text = "; ".join(
                 f"{name}: {status.kind} ({status.detail}"
                 + (f"; retry after ~{status.retry_after_seconds}s" if status.retry_after_seconds is not None else "")
                 + ")" for name, status in collection.statuses.items())
             if collection.all_unavailable:
-                await interaction.followup.send("Sources unavailable. No real collection succeeded. " + status_text,
+                await interaction.followup.send("Sources unavailable from permitted cache. No real results are currently retained; daily collection runs at 6 PM Philippine time. " + status_text,
                                                 ephemeral=True)
                 return
-            result = await self.bot.delivery.post_jobs(interaction.guild_id, channel, collection.jobs)
+            result = await self.bot.delivery.post_jobs(
+                interaction.guild_id, channel, collection.jobs,
+                cycle_date=datetime.now(MANILA).date(),
+                partial_coverage=collection.partial_failure)
         except Exception as exc:
             await interaction.followup.send(
-                f"Real fetch or delivery stopped after an error ({type(exc).__name__}). Already posted jobs were saved; retry to resume.",
+                f"Real batch delivery failed ({type(exc).__name__}). No jobs in the failed batch were recorded.",
                 ephemeral=True)
             return
         coverage = "Partial coverage. " if collection.partial_failure else ""
-        jobs_text = (f"Posted {result.sent} real eligible NCR job(s) in {channel.mention}; "
+        jobs_text = (f"Posted {result.sent} real eligible NCR job(s) in one message in {channel.mention}; "
                      f"skipped {result.skipped_already_sent} already delivered job(s). ")
         if not collection.jobs:
-            jobs_text = "Collection succeeded, but no eligible NCR jobs were returned. "
+            jobs_text = "Collection succeeded, but no new eligible NCR jobs with disclosed salaries were returned. "
+        elif result.sent == 0:
+            jobs_text = "No new eligible NCR jobs with disclosed salaries remain for this server. "
         await interaction.followup.send(
             coverage + jobs_text + status_text,
             ephemeral=True)
@@ -184,8 +221,8 @@ def main() -> None:
     else:
         try:
             cache_seconds = int(os.getenv("JOOBLE_CACHE_SECONDS", "0"))
-            if not 0 <= cache_seconds <= 3600:
-                raise ValueError("cache seconds out of range")
+            if cache_seconds < 0:
+                raise ValueError("cache seconds must be nonnegative")
             adapter = JooblePhilippinesSource(key, discord_approved=True,
                                               keywords=os.getenv("JOOBLE_KEYWORDS", "jobs"),
                                               usage_sessions=sessions)

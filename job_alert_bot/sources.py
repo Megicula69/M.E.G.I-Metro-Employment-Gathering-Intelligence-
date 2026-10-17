@@ -28,6 +28,7 @@ class SampleDataSource:
                        Salary(lower=Decimal("35000"), period=SalaryPeriod.MONTHLY),
                        "On-site", "Full-time", "https://example.com/jobs/support"),
             JobListing("sample", "designer", "[SAMPLE] Product Designer", "Sample Company D",
-                       "Taguig City, NCR", True, Salary(),
-                       "Hybrid", "Contract", "https://example.com/jobs/designer"),
+                       "Taguig City, NCR", True,
+                       Salary(lower=Decimal("40000"), period=None, raw="PHP 40,000"),
+                       "", "Contract", "https://example.com/jobs/designer"),
         ]

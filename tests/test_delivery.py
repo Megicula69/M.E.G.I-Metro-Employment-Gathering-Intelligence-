@@ -1,91 +1,127 @@
 import asyncio
 from dataclasses import replace
+from datetime import date
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-from job_alert_bot.database import Base, JobDelivery, ServerConfig
+from job_alert_bot.database import Base, DailyBatch, JobDelivery, ServerConfig
 from job_alert_bot.delivery import DeliveryService
+from job_alert_bot.jobs import Salary, SalaryPeriod
 from job_alert_bot.sources import SampleDataSource
-from job_alert_bot.jobs import JobListing, Salary
 
 
 class FakeChannel:
-    def __init__(self, fail_on=None):
+    def __init__(self, fail=False):
         self.messages = []
-        self.fail_on = fail_on
+        self.fail = fail
 
     async def send(self, **kwargs):
-        if self.fail_on == len(self.messages) + 1:
-            raise RuntimeError("simulated send failure")
+        if self.fail:
+            raise RuntimeError("send failed")
         self.messages.append(kwargs)
         return type("Message", (), {"id": len(self.messages)})()
 
 
-def test_per_server_deduplication_and_partial_resume(tmp_path):
+def setup(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     Base.metadata.create_all(engine)
     sessions = sessionmaker(engine, expire_on_commit=False)
     with sessions.begin() as session:
         session.add_all([ServerConfig(guild_id=1, alert_channel_id=10),
                          ServerConfig(guild_id=2, alert_channel_id=20)])
+    return sessions
+
+
+def test_one_message_links_and_tracking_after_success(tmp_path):
+    sessions = setup(tmp_path)
+    jobs = asyncio.run(SampleDataSource().fetch_jobs())
     service = DeliveryService(sessions)
-    channel_one = FakeChannel(fail_on=2)
-    source = SampleDataSource()
-
-    with pytest.raises(RuntimeError, match="simulated"):
-        asyncio.run(service.post_new(1, channel_one, source))
+    channel = FakeChannel(fail=True)
+    with pytest.raises(RuntimeError):
+        asyncio.run(service.post_jobs(1, channel, jobs, cycle_date=date(2026, 10, 17)))
     with sessions() as session:
-        assert len(session.scalars(select(JobDelivery).where(JobDelivery.guild_id == 1)).all()) == 1
+        assert session.scalars(select(JobDelivery)).all() == []
+    channel.fail = False
+    result = asyncio.run(service.post_jobs(1, channel, jobs, cycle_date=date(2026, 10, 17)))
+    assert result.sent == len(jobs)
+    assert len(channel.messages) == 1
+    description = channel.messages[0]["embed"].description
+    for job in jobs:
+        assert job.application_url in description
+    with sessions() as session:
+        deliveries = session.scalars(select(JobDelivery)).all()
+        assert len(deliveries) == len(jobs)
+        assert {item.message_id for item in deliveries} == {1}
+        assert session.get(DailyBatch, (1, date(2026, 10, 17))).message_id == 1
+    assert asyncio.run(service.post_jobs(1, channel, jobs, cycle_date=date(2026, 10, 17))).sent == 0
+    assert len(channel.messages) == 1
+    other = FakeChannel()
+    assert asyncio.run(service.post_jobs(2, other, jobs, cycle_date=date(2026, 10, 17))).sent == len(jobs)
+    assert len(other.messages) == 1
 
-    channel_one.fail_on = None
-    resumed = asyncio.run(service.post_new(1, channel_one, source))
-    assert resumed.sent == 3
-    assert resumed.skipped_already_sent == 1
-    assert len(channel_one.messages) == 4
-    assert asyncio.run(service.post_new(1, channel_one, source)).sent == 0
 
-    channel_two = FakeChannel()
-    assert asyncio.run(service.post_new(2, channel_two, source)).sent == 4
-    assert len(channel_two.messages) == 4
-    for message in channel_two.messages:
-        button = message["view"].children[0]
-        assert button.url.startswith("https://example.com/jobs/")
-
-
-def test_batch_is_capped_at_fifteen(tmp_path):
-    engine = create_engine(f"sqlite:///{tmp_path / 'limit.db'}")
-    Base.metadata.create_all(engine)
-    sessions = sessionmaker(engine)
-    with sessions.begin() as session:
-        session.add(ServerConfig(guild_id=1, alert_channel_id=10))
-
-    class ManyJobs:
-        async def fetch_jobs(self):
-            sample = (await SampleDataSource().fetch_jobs())[0]
-            return [replace(sample, source_id=str(index),
-                            application_url=f"https://example.com/jobs/{index}") for index in range(20)]
-
+def test_limit_arrangement_and_sample_label(tmp_path):
+    sessions = setup(tmp_path)
+    original = asyncio.run(SampleDataSource().fetch_jobs())[0]
+    jobs = [replace(original, source_id=str(index), title="X" * 300,
+                    employer="Y" * 300, location="Makati " + "Z" * 300,
+                    work_arrangement="Not specified",
+                    application_url=f"https://example.com/jobs/{index}") for index in range(30)]
     channel = FakeChannel()
-    result = asyncio.run(DeliveryService(sessions).post_new(1, channel, ManyJobs()))
-    assert result.sent == len(channel.messages) == 15
+    result = asyncio.run(DeliveryService(sessions).post_jobs(1, channel, jobs, sample=True))
+    assert 1 <= result.sent <= 15
+    embed = channel.messages[0]["embed"]
+    assert "SAMPLE" in embed.title
+    assert len(embed.description) <= 4096
+    assert "Not specified" not in embed.description
+    assert "Arrangement" not in embed.description
+    assert embed.description.count("[View / Apply]") == result.sent
 
 
-def test_delivery_history_deduplicates_same_url_across_sources_and_servers(tmp_path):
-    engine = create_engine(f"sqlite:///{tmp_path / 'cross.db'}")
-    Base.metadata.create_all(engine)
-    sessions = sessionmaker(engine)
-    with sessions.begin() as session:
-        session.add_all([ServerConfig(guild_id=1, alert_channel_id=10),
-                         ServerConfig(guild_id=2, alert_channel_id=20)])
-    first = JobListing("A", "a1", "Engineer", "Employer", "Makati, NCR", True,
-                       Salary(), "Hybrid", "Full-time", "https://jobs.example.org/7?utm_source=a")
-    second = replace(first, source="B", source_id="b9",
-                     application_url="https://jobs.example.org/7?utm_source=b")
-    delivery = DeliveryService(sessions)
+def test_cross_source_url_duplicate_per_server(tmp_path):
+    sessions = setup(tmp_path)
+    first = asyncio.run(SampleDataSource().fetch_jobs())[0]
+    second = replace(first, source="Other", source_id="other",
+                     application_url=first.application_url + "?utm_source=elsewhere")
+    service = DeliveryService(sessions)
     one, two = FakeChannel(), FakeChannel()
-    assert asyncio.run(delivery.post_jobs(1, one, [first])).sent == 1
-    assert asyncio.run(delivery.post_jobs(1, one, [second])).sent == 0
-    assert asyncio.run(delivery.post_jobs(2, two, [second])).sent == 1
-    assert len(one.messages) == len(two.messages) == 1
+    assert asyncio.run(service.post_jobs(1, one, [first, second])).sent == 1
+    assert asyncio.run(service.post_jobs(1, one, [second])).sent == 0
+    assert asyncio.run(service.post_jobs(2, two, [second])).sent == 1
+
+
+@pytest.mark.parametrize("salary", [
+    Salary(), Salary(raw="Negotiable"), Salary(lower=Decimal("0")),
+    Salary(lower=Decimal("-2")), Salary(raw="Commission only"),
+    Salary(lower=Decimal("NaN")),
+])
+def test_undisclosed_or_invalid_salary_excluded(tmp_path, salary):
+    sessions = setup(tmp_path)
+    job = replace(asyncio.run(SampleDataSource().fetch_jobs())[0], salary=salary)
+    channel = FakeChannel()
+    assert asyncio.run(DeliveryService(sessions).post_jobs(1, channel, [job])).sent == 0
+    assert channel.messages == []
+
+
+def test_noncomparable_positive_base_follows_monthly(tmp_path):
+    sessions = setup(tmp_path)
+    first = asyncio.run(SampleDataSource().fetch_jobs())[0]
+    unknown = replace(first, source_id="unknown", salary=Salary(lower=Decimal("100000"),
+                      period=None, raw="PHP 100,000"), application_url="https://example.com/u")
+    monthly = replace(first, source_id="monthly", salary=Salary(lower=Decimal("80000"),
+                      period=SalaryPeriod.MONTHLY), application_url="https://example.com/m")
+    channel = FakeChannel()
+    asyncio.run(DeliveryService(sessions).post_jobs(1, channel, [unknown, monthly]))
+    text = channel.messages[0]["embed"].description
+    assert text.index("example.com/m") < text.index("example.com/u")
+
+
+def test_partial_coverage_visible_in_batch(tmp_path):
+    sessions = setup(tmp_path)
+    jobs = asyncio.run(SampleDataSource().fetch_jobs())
+    channel = FakeChannel()
+    asyncio.run(DeliveryService(sessions).post_jobs(1, channel, jobs, partial_coverage=True))
+    assert "Partial source coverage" in channel.messages[0]["embed"].footer.text

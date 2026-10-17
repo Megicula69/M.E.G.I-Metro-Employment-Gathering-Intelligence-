@@ -82,6 +82,14 @@ def eligible(job: JobListing, now: datetime | None = None) -> bool:
         return False
     if not usable_application_url(job.application_url) or job.confirmed_closed:
         return False
+    # A numeric, finite, positive base amount must be disclosed. Unknown pay
+    # periods remain eligible but rank after comparable monthly salaries.
+    if (job.salary.lower is None or not job.salary.lower.is_finite()
+            or job.salary.lower <= 0):
+        return False
+    if (job.salary.upper is not None and
+            (not job.salary.upper.is_finite() or job.salary.upper < job.salary.lower)):
+        return False
     if job.expires_at is not None:
         if job.expires_at.tzinfo is None:
             raise ValueError("expires_at must include a timezone")
@@ -92,7 +100,8 @@ def eligible(job: JobListing, now: datetime | None = None) -> bool:
 
 def monthly_salary_lower(job: JobListing) -> Decimal | None:
     salary = job.salary
-    if salary.currency.upper() != "PHP" or salary.lower is None or salary.lower <= 0:
+    if (salary.currency.upper() != "PHP" or salary.lower is None
+            or not salary.lower.is_finite() or salary.lower <= 0):
         return None
     if salary.period == SalaryPeriod.MONTHLY:
         return salary.lower
